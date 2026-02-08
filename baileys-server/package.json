@@ -5,10 +5,11 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "dev": "node --watch src/index.js",
+    "clean": "rm -rf baileys_auth_info"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.16",
+    "@whiskeysockets/baileys": "latest",
     "cors": "^2.8.5",
     "express": "^4.21.2",
     "pino": "^9.6.0",
