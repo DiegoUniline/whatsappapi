@@ -355,15 +355,21 @@ async function connectWhatsApp() {
       for (const msg of messages) {
         if (msg.key.fromMe) continue;
         
-        // Get sender phone - handle both @s.whatsapp.net and @lid formats
-        let phone = msg.key.remoteJid || '';
+        // Get sender phone - prioritize senderPn (contains real phone number)
+        let phone = '';
         
-        // Handle @lid format (WhatsApp Business LinkedIn ID)
-        if (phone.includes('@lid')) {
-          phone = phone.replace('@lid', '');
-          console.log(`[BAILEYS] LID format detected, extracted: ${phone}`);
-        } else {
-          phone = phone.replace('@s.whatsapp.net', '');
+        if (msg.key.senderPn) {
+          // senderPn contains the actual phone number when remoteJid is @lid format
+          phone = msg.key.senderPn.replace('@s.whatsapp.net', '');
+          console.log(`[BAILEYS] Using senderPn: ${phone}`);
+        } else if (msg.key.remoteJid) {
+          // Fallback to remoteJid if senderPn not available
+          if (msg.key.remoteJid.includes('@lid')) {
+            phone = msg.key.remoteJid.replace('@lid', '');
+            console.log(`[BAILEYS] LID format (no senderPn): ${phone}`);
+          } else {
+            phone = msg.key.remoteJid.replace('@s.whatsapp.net', '');
+          }
         }
         
         const pushName = msg.pushName || '';
