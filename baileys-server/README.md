@@ -26,11 +26,10 @@ Este servidor permite conectar WhatsApp directamente a tu aplicación usando [Ba
 Agrega estas variables en la sección "Environment":
 
 ```
-SUPABASE_URL=https://ewiayikxrcvjvcjqqjvj.supabase.co
-SUPABASE_SERVICE_KEY=tu_service_role_key
-LOVABLE_API_KEY=tu_lovable_api_key
 API_SECRET=crea_una_clave_secreta_aleatoria
 ```
+
+**¡Eso es todo!** Solo necesitas UNA variable. El procesamiento de mensajes lo hace automáticamente una Edge Function de Lovable Cloud.
 
 ### 4. Conectar desde Apunta
 
