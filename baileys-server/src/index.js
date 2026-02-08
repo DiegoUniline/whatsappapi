@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion, initAuthCreds, BufferJSON } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const QRCode = require('qrcode');
 const fs = require('fs');
@@ -16,7 +16,9 @@ app.use(express.json());
 // Configuración
 const API_SECRET = process.env.API_SECRET || 'dev-secret-key';
 const EDGE_FUNCTION_URL = process.env.EDGE_FUNCTION_URL || 'https://ewiayikxrcvjvcjqqjvj.supabase.co/functions/v1/baileys-process-message';
+const CREDENTIALS_URL = process.env.CREDENTIALS_URL || 'https://ewiayikxrcvjvcjqqjvj.supabase.co/functions/v1/baileys-credentials';
 const AUTH_FOLDER = './baileys_auth_info';
+const SERVER_NAME = process.env.SERVER_NAME || 'default';
 
 // Estado de la conexión
 let sock = null;
@@ -39,27 +41,183 @@ const authenticate = (req, res, next) => {
   next();
 };
 
-// Función para limpiar sesión
-function clearSession() {
+// ============ PERSISTENCIA EN SUPABASE ============
+
+// Guardar credenciales en Supabase
+async function saveCredentialsToSupabase(authState) {
   try {
+    console.log('[BAILEYS] Saving credentials to Supabase...');
+    
+    const response = await fetch(CREDENTIALS_URL, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${API_SECRET}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        action: 'save',
+        server_name: SERVER_NAME,
+        auth_state: authState,
+        connected_phone: connectedPhone,
+      }),
+    });
+
+    const data = await response.json();
+    
+    if (data.success) {
+      console.log('[BAILEYS] ✅ Credentials saved to Supabase');
+    } else {
+      console.error('[BAILEYS] ❌ Failed to save credentials:', data.error);
+    }
+    
+    return data.success;
+  } catch (error) {
+    console.error('[BAILEYS] ❌ Error saving to Supabase:', error.message);
+    return false;
+  }
+}
+
+// Cargar credenciales desde Supabase
+async function loadCredentialsFromSupabase() {
+  try {
+    console.log('[BAILEYS] Loading credentials from Supabase...');
+    
+    const response = await fetch(CREDENTIALS_URL, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${API_SECRET}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        action: 'get',
+        server_name: SERVER_NAME,
+      }),
+    });
+
+    const data = await response.json();
+    
+    if (data.success && data.exists) {
+      console.log('[BAILEYS] ✅ Credentials loaded from Supabase, phone:', data.connected_phone);
+      return data.auth_state;
+    }
+    
+    console.log('[BAILEYS] No credentials in Supabase, starting fresh');
+    return null;
+  } catch (error) {
+    console.error('[BAILEYS] ❌ Error loading from Supabase:', error.message);
+    return null;
+  }
+}
+
+// Eliminar credenciales de Supabase
+async function deleteCredentialsFromSupabase() {
+  try {
+    console.log('[BAILEYS] Deleting credentials from Supabase...');
+    
+    const response = await fetch(CREDENTIALS_URL, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${API_SECRET}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        action: 'delete',
+        server_name: SERVER_NAME,
+      }),
+    });
+
+    const data = await response.json();
+    console.log('[BAILEYS] Credentials deleted:', data.success);
+    return data.success;
+  } catch (error) {
+    console.error('[BAILEYS] ❌ Error deleting from Supabase:', error.message);
+    return false;
+  }
+}
+
+// Auth state híbrido: usa archivos locales + sincroniza con Supabase
+async function useHybridAuthState() {
+  // Primero intentar cargar desde Supabase
+  const supabaseState = await loadCredentialsFromSupabase();
+  
+  // Si hay estado en Supabase y no hay local, restaurar
+  if (supabaseState && !fs.existsSync(AUTH_FOLDER)) {
+    console.log('[BAILEYS] Restoring credentials from Supabase to local...');
+    fs.mkdirSync(AUTH_FOLDER, { recursive: true });
+    
+    // Escribir cada archivo del estado
+    for (const [key, value] of Object.entries(supabaseState)) {
+      const filePath = path.join(AUTH_FOLDER, `${key}.json`);
+      fs.writeFileSync(filePath, JSON.stringify(value, BufferJSON.replacer));
+    }
+    console.log('[BAILEYS] ✅ Credentials restored from Supabase');
+  }
+  
+  // Usar el auth state de archivos (ahora con datos de Supabase si aplica)
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
+  
+  // Wrapper para guardar también en Supabase
+  const saveCredsWithSync = async () => {
+    await saveCreds();
+    
+    // Leer todos los archivos y sincronizar con Supabase
+    try {
+      const files = fs.readdirSync(AUTH_FOLDER);
+      const authState = {};
+      
+      for (const file of files) {
+        if (file.endsWith('.json')) {
+          const key = file.replace('.json', '');
+          const content = fs.readFileSync(path.join(AUTH_FOLDER, file), 'utf-8');
+          authState[key] = JSON.parse(content, BufferJSON.reviver);
+        }
+      }
+      
+      // Guardar en Supabase de forma async (no bloquear)
+      saveCredentialsToSupabase(authState).catch(console.error);
+    } catch (err) {
+      console.error('[BAILEYS] Error syncing to Supabase:', err.message);
+    }
+  };
+  
+  return { state, saveCreds: saveCredsWithSync };
+}
+
+// Función para limpiar sesión (local + Supabase)
+async function clearSession() {
+  try {
+    // Limpiar local
     if (fs.existsSync(AUTH_FOLDER)) {
       fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
-      console.log('[BAILEYS] Session cleared');
+      console.log('[BAILEYS] Local session cleared');
     }
+    
+    // Limpiar Supabase
+    await deleteCredentialsFromSupabase();
   } catch (err) {
     console.error('[BAILEYS] Error clearing session:', err);
   }
 }
 
-// Función para procesar mensaje entrante
-async function processIncomingMessage(phone, message, pushName) {
-  console.log(`[BAILEYS] Processing message from ${phone}: ${message}`);
+// ============ PROCESAMIENTO DE MENSAJES ============
+
+async function processIncomingMessage(phone, message, pushName, mediaType = null, mediaUrl = null) {
+  console.log(`[BAILEYS] Processing message from ${phone}: ${message} (mediaType: ${mediaType})`);
+  console.log(`[BAILEYS] Connected as: ${connectedPhone}`);
 
   try {
     const response = await fetch(EDGE_FUNCTION_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ phone, message, pushName, secret: API_SECRET }),
+      body: JSON.stringify({ 
+        phone, 
+        message, 
+        pushName, 
+        secret: API_SECRET,
+        mediaType,
+        mediaUrl,
+        toPhone: connectedPhone // El número al que llegó el mensaje
+      }),
     });
 
     const data = await response.json();
@@ -87,7 +245,8 @@ async function sendMessage(phone, text) {
   console.log(`[BAILEYS] Message sent to ${jid}`);
 }
 
-// Conectar a WhatsApp
+// ============ CONEXIÓN WHATSAPP ============
+
 async function connectWhatsApp() {
   if (isConnecting) {
     console.log('[BAILEYS] Already connecting, skipping...');
@@ -96,7 +255,7 @@ async function connectWhatsApp() {
 
   if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
     console.log('[BAILEYS] Max reconnect attempts reached. Clearing session and restarting...');
-    clearSession();
+    await clearSession();
     reconnectAttempts = 0;
   }
 
@@ -104,19 +263,18 @@ async function connectWhatsApp() {
   console.log('[BAILEYS] Starting connection... (attempt', reconnectAttempts + 1, ')');
 
   try {
-    // Obtener la última versión de Baileys
     const { version, isLatest } = await fetchLatestBaileysVersion();
     console.log(`[BAILEYS] Using WA version ${version.join('.')}, isLatest: ${isLatest}`);
 
-    const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
-    console.log('[BAILEYS] Auth state loaded');
+    // Usar auth state híbrido (local + Supabase)
+    const { state, saveCreds } = await useHybridAuthState();
+    console.log('[BAILEYS] Auth state loaded (hybrid mode)');
 
     sock = makeWASocket({
       auth: state,
       logger,
       version,
       browser: ['Apunta Bot', 'Chrome', '120.0.0'],
-      // NO usar printQRInTerminal (deprecado)
       connectTimeoutMs: 60000,
       defaultQueryTimeoutMs: 60000,
       keepAliveIntervalMs: 30000,
@@ -127,23 +285,21 @@ async function connectWhatsApp() {
       markOnlineOnConnect: false,
     });
 
-    // Manejar actualizaciones de conexión (IMPORTANTE: aquí se maneja el QR)
+    // Manejar actualizaciones de conexión
     sock.ev.on('connection.update', async (update) => {
       const { qr, connection, lastDisconnect } = update;
 
-      // QR disponible - generar imagen
       if (qr) {
         try {
           qrCode = await QRCode.toDataURL(qr);
           connectionStatus = 'waiting_qr';
-          reconnectAttempts = 0; // Reset en QR exitoso
+          reconnectAttempts = 0;
           console.log('[BAILEYS] ✅ QR code generated successfully!');
         } catch (err) {
           console.error('[BAILEYS] Error generating QR image:', err);
         }
       }
 
-      // Conexión abierta
       if (connection === 'open') {
         connectionStatus = 'connected';
         qrCode = null;
@@ -151,9 +307,14 @@ async function connectWhatsApp() {
         reconnectAttempts = 0;
         connectedPhone = sock.user?.id?.split(':')[0] || null;
         console.log('[BAILEYS] ✅ Connected successfully as:', connectedPhone);
+        
+        // Sincronizar credenciales a Supabase después de conectar
+        console.log('[BAILEYS] Syncing credentials to Supabase after connection...');
+        setTimeout(() => {
+          saveCreds().catch(console.error);
+        }, 2000);
       }
 
-      // Conexión cerrada
       if (connection === 'close') {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const reason = DisconnectReason[Object.keys(DisconnectReason).find(k => DisconnectReason[k] === statusCode)] || statusCode;
@@ -165,12 +326,11 @@ async function connectWhatsApp() {
         connectedPhone = null;
         isConnecting = false;
 
-        // Determinar si reconectar
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
         
         if (statusCode === 405 || statusCode === 401) {
           console.log('[BAILEYS] ⚠️ Auth error (405/401). Clearing session...');
-          clearSession();
+          await clearSession();
           reconnectAttempts = 0;
         }
 
@@ -185,7 +345,7 @@ async function connectWhatsApp() {
       }
     });
 
-    // Guardar credenciales
+    // Guardar credenciales (con sync a Supabase)
     sock.ev.on('creds.update', saveCreds);
 
     // Manejar mensajes entrantes
@@ -195,15 +355,76 @@ async function connectWhatsApp() {
       for (const msg of messages) {
         if (msg.key.fromMe) continue;
         
-        const phone = msg.key.remoteJid?.replace('@s.whatsapp.net', '') || '';
-        const text = msg.message?.conversation || 
-                     msg.message?.extendedTextMessage?.text || 
-                     '';
+        // Get sender phone - handle both @s.whatsapp.net and @lid formats
+        let phone = msg.key.remoteJid || '';
+        
+        // Handle @lid format (WhatsApp Business LinkedIn ID)
+        if (phone.includes('@lid')) {
+          phone = phone.replace('@lid', '');
+          console.log(`[BAILEYS] LID format detected, extracted: ${phone}`);
+        } else {
+          phone = phone.replace('@s.whatsapp.net', '');
+        }
+        
         const pushName = msg.pushName || '';
 
-        if (text && phone && !phone.includes('@g.us')) {
-          console.log(`[BAILEYS] 📩 Message from ${phone}: ${text}`);
-          await processIncomingMessage(phone, text, pushName);
+        // Skip group messages
+        if (msg.key.remoteJid?.includes('@g.us')) continue;
+        
+        // Extract message content based on type
+        let text = '';
+        let mediaType = null;
+        let mediaUrl = null;
+        
+        if (msg.message?.conversation) {
+          text = msg.message.conversation;
+        } else if (msg.message?.extendedTextMessage?.text) {
+          text = msg.message.extendedTextMessage.text;
+        } else if (msg.message?.audioMessage) {
+          // Audio/voice message
+          mediaType = 'audio';
+          text = '[🎤 Mensaje de voz]';
+          
+          // Download audio if needed
+          try {
+            const buffer = await sock.downloadMediaMessage(msg);
+            if (buffer) {
+              // Convert to base64 for the edge function
+              const base64 = buffer.toString('base64');
+              const mimetype = msg.message.audioMessage.mimetype || 'audio/ogg';
+              mediaUrl = `data:${mimetype};base64,${base64}`;
+            }
+          } catch (err) {
+            console.error('[BAILEYS] Error downloading audio:', err);
+          }
+        } else if (msg.message?.imageMessage) {
+          // Image message
+          mediaType = 'image';
+          text = msg.message.imageMessage.caption || '[📷 Imagen]';
+          
+          try {
+            const buffer = await sock.downloadMediaMessage(msg);
+            if (buffer) {
+              const base64 = buffer.toString('base64');
+              const mimetype = msg.message.imageMessage.mimetype || 'image/jpeg';
+              mediaUrl = `data:${mimetype};base64,${base64}`;
+            }
+          } catch (err) {
+            console.error('[BAILEYS] Error downloading image:', err);
+          }
+        } else if (msg.message?.documentMessage) {
+          // Document
+          mediaType = 'document';
+          text = `[📄 ${msg.message.documentMessage.fileName || 'Documento'}]`;
+        } else if (msg.message?.videoMessage) {
+          // Video
+          mediaType = 'video';
+          text = msg.message.videoMessage.caption || '[🎥 Video]';
+        }
+
+        if ((text || mediaType) && phone) {
+          console.log(`[BAILEYS] 📩 Message from ${phone}: ${text} (type: ${mediaType || 'text'})`);
+          await processIncomingMessage(phone, text, pushName, mediaType, mediaUrl);
         }
       }
     });
@@ -229,6 +450,8 @@ app.get('/health', (req, res) => {
     whatsapp: connectionStatus,
     node: process.version,
     reconnectAttempts,
+    serverName: SERVER_NAME,
+    persistenceEnabled: true,
   });
 });
 
@@ -237,6 +460,7 @@ app.get('/api/status', authenticate, (req, res) => {
     status: connectionStatus,
     phone: connectedPhone,
     hasQR: !!qrCode,
+    persistenceEnabled: true,
   });
 });
 
@@ -267,12 +491,40 @@ app.post('/api/send', authenticate, async (req, res) => {
   }
 });
 
+// Enviar imagen
+app.post('/api/send-image', authenticate, async (req, res) => {
+  const { phone, imageUrl, caption } = req.body;
+
+  if (!phone || !imageUrl) {
+    return res.status(400).json({ error: 'phone and imageUrl required' });
+  }
+
+  if (!sock || connectionStatus !== 'connected') {
+    return res.status(500).json({ error: 'WhatsApp not connected' });
+  }
+
+  try {
+    const jid = phone.includes('@s.whatsapp.net') ? phone : `${phone.replace(/\D/g, '')}@s.whatsapp.net`;
+    
+    await sock.sendMessage(jid, {
+      image: { url: imageUrl },
+      caption: caption || ''
+    });
+    
+    console.log(`[BAILEYS] Image sent to ${jid}`);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[BAILEYS] Error sending image:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post('/api/logout', authenticate, async (req, res) => {
   try {
     if (sock) {
       await sock.logout();
     }
-    clearSession();
+    await clearSession();
     connectionStatus = 'disconnected';
     qrCode = null;
     connectedPhone = null;
@@ -288,22 +540,19 @@ app.post('/api/reconnect', authenticate, async (req, res) => {
   try {
     console.log('[BAILEYS] Manual reconnect requested');
     
-    // Cerrar conexión actual
     if (sock) {
       sock.end();
       sock = null;
     }
     
-    // Limpiar estado
     connectionStatus = 'disconnected';
     qrCode = null;
     isConnecting = false;
     reconnectAttempts = 0;
     
     // Limpiar sesión para forzar nuevo QR
-    clearSession();
+    await clearSession();
     
-    // Reconectar
     setTimeout(connectWhatsApp, 1000);
     
     res.json({ success: true, message: 'Reconnecting with fresh session...' });
@@ -312,30 +561,81 @@ app.post('/api/reconnect', authenticate, async (req, res) => {
   }
 });
 
-// Ruta para limpiar sesión manualmente
-app.post('/api/clear-session', authenticate, (req, res) => {
+app.post('/api/clear-session', authenticate, async (req, res) => {
   try {
     if (sock) {
       sock.end();
       sock = null;
     }
-    clearSession();
+    await clearSession();
     connectionStatus = 'disconnected';
     qrCode = null;
     connectedPhone = null;
     isConnecting = false;
     reconnectAttempts = 0;
-    res.json({ success: true, message: 'Session cleared' });
+    res.json({ success: true, message: 'Session cleared (local + Supabase)' });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
+
+// Nueva ruta para forzar sync a Supabase
+app.post('/api/sync-credentials', authenticate, async (req, res) => {
+  try {
+    if (!fs.existsSync(AUTH_FOLDER)) {
+      return res.json({ success: false, message: 'No local credentials to sync' });
+    }
+    
+    const files = fs.readdirSync(AUTH_FOLDER);
+    const authState = {};
+    
+    for (const file of files) {
+      if (file.endsWith('.json')) {
+        const key = file.replace('.json', '');
+        const content = fs.readFileSync(path.join(AUTH_FOLDER, file), 'utf-8');
+        authState[key] = JSON.parse(content, BufferJSON.reviver);
+      }
+    }
+    
+    const success = await saveCredentialsToSupabase(authState);
+    res.json({ success, message: success ? 'Credentials synced to Supabase' : 'Sync failed' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============ KEEP-ALIVE SELF-PING ============
+
+// Self-ping para evitar que Render duerma el servidor por inactividad HTTP
+function startSelfPing() {
+  const SELF_PING_INTERVAL = 10 * 60 * 1000; // 10 minutos
+  
+  setInterval(async () => {
+    try {
+      const url = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+      const response = await fetch(`${url}/health`);
+      const data = await response.json();
+      console.log(`[KEEP-ALIVE] Self-ping OK - WhatsApp: ${data.whatsapp}, Time: ${new Date().toISOString()}`);
+    } catch (error) {
+      console.error('[KEEP-ALIVE] Self-ping failed:', error.message);
+    }
+  }, SELF_PING_INTERVAL);
+  
+  console.log(`[KEEP-ALIVE] Self-ping enabled every ${SELF_PING_INTERVAL / 60000} minutes`);
+}
 
 // ============ INICIAR SERVIDOR ============
 
 app.listen(PORT, () => {
   console.log(`[BAILEYS] 🚀 Server running on port ${PORT}`);
   console.log(`[BAILEYS] Node version: ${process.version}`);
-  console.log(`[BAILEYS] Edge function URL: ${EDGE_FUNCTION_URL}`);
+  console.log(`[BAILEYS] Server name: ${SERVER_NAME}`);
+  console.log(`[BAILEYS] Credentials URL: ${CREDENTIALS_URL}`);
+  console.log(`[BAILEYS] Persistence: ENABLED (Supabase)`);
+  
+  // Iniciar conexión WhatsApp
   connectWhatsApp();
+  
+  // Iniciar self-ping para mantener el servidor activo
+  startSelfPing();
 });
